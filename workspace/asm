@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+
+if len(sys.argv) < 4 or sys.argv[2] != "-o":
+    print("Usage: compiler <input.py> -o <output>")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[3]
+
+with open(input_file) as f:
+    line = f.readline().strip()
+
+# Parse x = 42
+if "=" in line:
+    _, value = line.split("=")
+    value = int(value.strip())
+else:
+    print("Expected variable assignment.")
+    sys.exit(1)
+
+asm = f"""
+    .data
+str: .ascii "{value}\\n"
+len = . - str
+
+    .text
+    .global _start
+_start:
+    mov x0, #1              // fd = stdout
+    adr x1, str             // pointer to string
+    mov x2, len             // length of string
+    mov x8, #64             // syscall: write
+    svc #0
+
+    mov x0, #0              // exit
+    mov x8, #93
+    svc #0
+"""
+
+with open("out.s", "w") as f:
+    f.write(asm)
+
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+import re
+
+# Handle args
+if len(sys.argv) < 2:
+    print("Usage: compiler <input.py> [-o <output>]")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = "a.out"  # default
+
+if "-o" in sys.argv:
+    o_index = sys.argv.index("-o")
+    if o_index + 1 < len(sys.argv):
+        output_file = sys.argv[o_index + 1]
+    else:
+        print("❌ Output file not specified after -o")
+        sys.exit(1)
+
+# Read lines
+with open(input_file) as f:
+    lines = [line.strip() for line in f if line.strip()]
+
+data_section = []
+text_section = [
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+data_count = 0
+
+def add_data(val, add_newline=True):
+    global data_count
+    label = f"str{data_count}"
+    esc_val = val.replace('"', '\\"')
+    if add_newline:
+        data_section.append(f'{label}: .ascii "{esc_val}\\n"')
+    else:
+        data_section.append(f'{label}: .ascii "{esc_val}"')
+    data_section.append(f'{label}_len = . - {label}')
+    data_count += 1
+    return label
+
+def emit_print(label):
+    return [
+        f"    mov x0, #1",
+        f"    adr x1, {label}",
+        f"    mov x2, {label}_len",
+        f"    mov x8, #64",
+        f"    svc #0"
+    ]
+
+def emit_print_space():
+    space_label = add_data(" ", add_newline=False)
+    return emit_print(space_label)
+
+def eval_expr(expr, variables):
+    # Replace variable names in expr with their values (quoted if string)
+    def repl_var(m):
+        var = m.group(0)
+        if var in variables:
+            val = variables[var]
+            if isinstance(val, str):
+                return f'"{val}"'
+            else:
+                return str(val)
+        return var
+
+    expr_vars_re = re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b')
+    expr_eval_str = expr_vars_re.sub(repl_var, expr)
+
+    try:
+        result = eval(expr_eval_str, {"__builtins__": {}})
+    except Exception:
+        return None
+    return result
+
+for line in lines:
+    if "=" in line and not line.startswith("print"):
+        name, expr = [x.strip() for x in line.split("=", 1)]
+        val = eval_expr(expr, variables)
+        if val is None:
+            print(f"❌ Unknown or invalid expression for variable '{name}': {expr}")
+            sys.exit(1)
+        variables[name] = val
+
+    elif line.startswith("print(") and line.endswith(")"):
+        args = line[6:-1].split(",")
+        args = [a.strip() for a in args]
+
+        # Evaluate and combine args into one string with spaces (like Python)
+        combined_str = ""
+        for i, arg in enumerate(args):
+            val = None
+            if arg.startswith('"') and arg.endswith('"'):
+                val = arg.strip('"')
+            else:
+                val = eval_expr(arg, variables)
+                if val is None:
+                    print(f"❌ Unknown variable or invalid expression in print: {arg}")
+                    sys.exit(1)
+
+            val_str = str(val)
+            if combined_str != "":
+                combined_str += " "
+            combined_str += val_str
+
+        label = add_data(combined_str, add_newline=True)
+        text_section += emit_print(label)
+
+text_section += [
+    "    mov x0, #0",
+    "    mov x8, #93",
+    "    svc #0"
+]
+
+asm = [".data"] + data_section + [""] + text_section
+
+with open("out.s", "w") as f:
+    f.write("\n".join(asm) + "\n")
+
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

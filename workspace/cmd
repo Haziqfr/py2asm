@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+
+if len(sys.argv) < 4 or sys.argv[2] != "-o":
+    print("Usage: compiler <input.py> -o <output>")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[3]
+
+with open(input_file) as f:
+    lines = [line.strip() for line in f if line.strip()]
+
+asm = []
+data_section = []
+text_section = [
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+reg_pool = ["x19", "x20", "x21", "x22"]
+data_count = 0
+
+def add_string_data(val):
+    global data_count
+    label = f"str{data_count}"
+    esc_val = val.replace('"', '\\"')
+    data_section.append(f'{label}: .ascii "{esc_val}\\n"')
+    data_section.append(f'{label}_len = . - {label}')
+    data_count += 1
+    return label
+
+def emit_print(label):
+    return [
+        f"    mov x0, #1",            # stdout
+        f"    adr x1, {label}",       # address of string
+        f"    mov x2, {label}_len",   # length
+        f"    mov x8, #64",           # syscall: write
+        f"    svc #0"
+    ]
+
+for line in lines:
+    if "=" in line and not line.startswith("print"):
+        name, value = [x.strip() for x in line.split("=", 1)]
+        if value.startswith('"') and value.endswith('"'):
+            label = add_string_data(value.strip('"'))
+            variables[name] = label
+        else:
+            try:
+                int_val = int(value)
+                label = add_string_data(str(int_val))
+                variables[name] = label
+            except ValueError:
+                try:
+                    float_val = float(value)
+                    label = add_string_data(str(float_val))
+                    variables[name] = label
+                except ValueError:
+                    print(f"❌ Unknown value for variable '{name}': {value}")
+                    sys.exit(1)
+
+    elif line.startswith("print(") and line.endswith(")"):
+        args = line[6:-1].split(",")
+        for arg in args:
+            arg = arg.strip()
+            if arg.startswith('"') and arg.endswith('"'):
+                label = add_string_data(arg.strip('"'))
+            elif arg in variables:
+                label = variables[arg]
+            else:
+                try:
+                    # Literal int or float
+                    int(arg)
+                    label = add_string_data(arg)
+                except:
+                    try:
+                        float(arg)
+                        label = add_string_data(arg)
+                    except:
+                        print(f"❌ Unknown variable or literal: {arg}")
+                        sys.exit(1)
+            text_section += emit_print(label)
+
+# Exit syscall
+text_section += [
+    "    mov x0, #0",
+    "    mov x8, #93",
+    "    svc #0"
+]
+
+asm = [".data"] + data_section + [""] + text_section
+
+with open("out.s", "w") as f:
+    f.write("\n".join(asm) + "\n")
+
+# Compile & link
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

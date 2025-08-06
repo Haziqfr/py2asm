@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+
+if len(sys.argv) < 4 or sys.argv[2] != "-o":
+    print("Usage: compiler <input.py> -o <output>")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[3]
+
+with open(input_file) as f:
+    lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+if not lines:
+    print("❌ Need at least a variable assignment or print statement.")
+    sys.exit(1)
+
+asm = [
+    "    .data"
+]
+
+data_section = []
+text_section = [
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+reg_pool = ["x19", "x20", "x21", "x22"]
+data_counter = 0
+
+def add_data_string(string):
+    global data_counter
+    label = f"str{data_counter}"
+    string = string.replace("\\n", "\n").replace('"', '')
+    escaped = string.encode('unicode_escape').decode().replace('"', '\\"')
+    data_section.append(f'{label}: .ascii "{escaped}\\n"')
+    data_section.append(f'len{data_counter} = . - {label}')
+    data_counter += 1
+    return label
+
+for line in lines:
+    if "=" in line and not line.startswith("print"):
+        # variable assignment
+        name, value = [x.strip() for x in line.split("=", 1)]
+
+        if value.startswith('"') and value.endswith('"'):
+            label = add_data_string(value.strip('"'))
+            variables[name] = label
+        elif value.isdigit():
+            label = add_data_string(value)
+            variables[name] = label
+        elif value.lower() in ["true", "false"]:
+            label = add_data_string(value.capitalize())
+            variables[name] = label
+        else:
+            print(f"❌ Unknown value for variable '{name}': {value}")
+            sys.exit(1)
+
+    elif line.startswith("print(") and line.endswith(")"):
+        inner = line[6:-1].strip()
+
+        if inner.startswith('"') and inner.endswith('"'):
+            # print("literal")
+            label = add_data_string(inner.strip('"'))
+        elif inner in variables:
+            label = variables[inner]
+        elif inner.isdigit():
+            label = add_data_string(inner)
+        elif inner.lower() in ["true", "false"]:
+            label = add_data_string(inner.capitalize())
+        else:
+            print(f"❌ Unknown variable or literal: {inner}")
+            sys.exit(1)
+
+        idx = data_section.index(next(x for x in data_section if x.startswith(label + ":")))
+        text_section += [
+            "    mov x0, #1",
+            f"    adr x1, {label}",
+            f"    mov x2, len{label[3:]}",  # len0, len1, etc.
+            "    mov x8, #64",
+            "    svc #0"
+        ]
+
+text_section += [
+    "    mov x0, #0",
+    "    mov x8, #93",
+    "    svc #0"
+]
+
+with open("out.s", "w") as f:
+    f.write("\n".join(asm + data_section + text_section) + "\n")
+
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

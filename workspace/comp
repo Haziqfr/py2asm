@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+
+import sys
+import subprocess
+
+if len(sys.argv) < 4 or sys.argv[2] != "-o":
+    print("Usage: compiler <input.py> -o <output>")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = sys.argv[3]
+
+with open(input_file) as f:
+    lines = [line.strip() for line in f if line.strip()]
+
+asm = [
+    "    .data",
+    "buffer: .byte 0",
+    "",
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+reg_pool = ["x19", "x20", "x21", "x22"]
+
+for line in lines:
+    if "=" in line:
+        name, value = [x.strip() for x in line.split("=")]
+        reg = reg_pool.pop(0)
+        asm.append(f"    mov {reg}, #{value}")
+        asm.append(f"    adr x0, buffer")
+        asm.append(f"    strb w{reg[1:]}, [x0]")  # NO extra garbage here
+        variables[name] = reg
+
+    elif line.startswith("print(") and line.endswith(")"):
+        var = line[6:-1].strip()
+        if var not in variables:
+            print(f"Unknown variable: {var}")
+            sys.exit(1)
+        asm += [
+            "    mov x0, #1",          # stdout
+            "    adr x1, buffer",      # buffer address
+            "    mov x2, #1",          # 1 byte
+            "    mov x8, #64",         # syscall: write
+            "    svc #0"
+        ]
+
+asm += [
+    "    mov x0, #0",    # exit code
+    "    mov x8, #93",   # syscall: exit
+    "    svc #0"
+]
+
+with open("out.s", "w") as f:
+    f.write("\n".join(asm) + "\n")  # <- This avoids EOF newline error
+
+# Compile and link
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

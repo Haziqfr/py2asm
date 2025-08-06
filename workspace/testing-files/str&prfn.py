@@ -1,3 +1,3 @@
-string = "hello world!"
+string = "hello\nworld!"
 
 print(string)

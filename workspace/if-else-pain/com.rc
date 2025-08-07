@@ -1,0 +1,312 @@
+use std::collections::HashMap;
+use std::fs;
+use std::process::Command;
+
+// --------------------------
+// AST (Abstract Syntax Tree)
+// --------------------------
+#[derive(Debug)]
+enum Value {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+#[derive(Debug)]
+enum Statement {
+    If {
+        condition: String,
+        then_branch: Vec<Statement>,
+        elif_branches: Vec<(String, Vec<Statement>)>,
+        else_branch: Option<Vec<Statement>>,
+    },
+    Print(Vec<String>),
+    Assign(String, String),
+    FunctionCall(String),
+}
+
+// --------------------------
+// Compiler State
+// --------------------------
+struct Compiler {
+    variables: HashMap<String, Value>,
+    functions: HashMap<String, Vec<Statement>>,
+    data_section: Vec<String>,
+    text_section: Vec<String>,
+    label_counter: usize,
+}
+
+impl Compiler {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            data_section: vec![".data".to_string()],
+            text_section: vec![
+                "    .text".to_string(),
+                "    .global _start".to_string(),
+                "_start:".to_string(),
+            ],
+            label_counter: 0,
+        }
+    }
+
+    fn new_label(&mut self, prefix: &str) -> String {
+        let label = format!("{}{}", prefix, self.label_counter);
+        self.label_counter += 1;
+        label
+    }
+
+    fn add_data(&mut self, val: &str) -> String {
+        let label = format!("str{}", self.data_section.len());
+        let bytes = val.as_bytes();
+        
+        self.data_section.push(format!("{}:", label));
+        self.data_section.push(format!("    .ascii \"{}\"", val.replace("\n", "\\n")));
+        self.data_section.push(format!("{}_len = . - {}", label, label));
+        
+        label
+    }
+
+    // --------------------------
+    // Condition Evaluation
+    // --------------------------
+    fn eval_condition(&self, expr: &str) -> bool {
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() != 3 {
+            panic!("Invalid condition: {}", expr);
+        }
+
+        let left = self.eval_expr(parts[0]);
+        let right = self.eval_expr(parts[2]);
+        let op = parts[1];
+
+        match (left, op, right) {
+            (Value::Int(a), ">", Value::Int(b)) => a > b,
+            (Value::Int(a), "<", Value::Int(b)) => a < b,
+            (Value::Int(a), "==", Value::Int(b)) => a == b,
+            _ => panic!("Unsupported comparison: {} {} {}", parts[0], op, parts[2]),
+        }
+    }
+
+    fn eval_expr(&self, expr: &str) -> Value {
+        if let Ok(num) = expr.parse::<i64>() {
+            return Value::Int(num);
+        }
+
+        if let Some(val) = self.variables.get(expr) {
+            return val.clone();
+        }
+
+        panic!("Unknown variable or invalid expression: {}", expr);
+    }
+
+    // --------------------------
+    // Code Generation
+    // --------------------------
+    fn compile(&mut self, statements: &[Statement]) {
+        for stmt in statements {
+            match stmt {
+                Statement::If {
+                    condition,
+                    then_branch,
+                    elif_branches,
+                    else_branch,
+                } => self.compile_if(condition, then_branch, elif_branches, else_branch),
+
+                Statement::Print(args) => {
+                    let label = self.add_data(&args.join(" "));
+                    self.text_section.push("    // print".to_string());
+                    self.text_section.push("    mov x0, #1".to_string());
+                    self.text_section.push(format!("    adr x1, {}", label));
+                    self.text_section.push(format!("    mov x2, {}_len", label));
+                    self.text_section.push("    mov x8, #64".to_string());
+                    self.text_section.push("    svc #0".to_string());
+                }
+
+                Statement::Assign(name, expr) => {
+                    let val = self.eval_expr(expr);
+                    self.variables.insert(name.clone(), val);
+                }
+
+                Statement::FunctionCall(name) => {
+                    if let Some(body) = self.functions.get(name) {
+                        self.compile(body);
+                    } else {
+                        panic!("Undefined function: {}", name);
+                    }
+                }
+            }
+        }
+    }
+
+    fn compile_if(
+        &mut self,
+        condition: &str,
+        then_branch: &[Statement],
+        elif_branches: &[(String, Vec<Statement>)],
+        else_branch: &Option<Vec<Statement>>,
+    ) {
+        let end_label = self.new_label("if_end_");
+        let mut next_label = self.new_label("elif_");
+
+        // Compile if condition
+        self.text_section.push(format!("    // if {}", condition));
+        if self.eval_condition(condition) {
+            self.compile(then_branch);
+        }
+        self.text_section.push(format!("    b {}", end_label));
+        self.text_section.push(format!("{}:", next_label));
+
+        // Compile elif branches
+        for (cond, branch) in elif_branches {
+            let next_elif_label = self.new_label("elif_");
+            self.text_section.push(format!("    // elif {}", cond));
+            if self.eval_condition(cond) {
+                self.compile(branch);
+                self.text_section.push(format!("    b {}", end_label));
+            }
+            self.text_section.push(format!("{}:", next_elif_label));
+            next_label = next_elif_label;
+        }
+
+        // Compile else branch
+        if let Some(branch) = else_branch {
+            self.compile(branch);
+        }
+
+        self.text_section.push(format!("{}:", end_label));
+    }
+
+    fn save_asm(&self, filename: &str) {
+        let mut asm = self.data_section.clone();
+        asm.push("".to_string());
+        asm.extend(self.text_section.clone());
+        asm.push("    // Exit".to_string());
+        asm.push("    mov x0, #0".to_string());
+        asm.push("    mov x8, #93".to_string());
+        asm.push("    svc #0".to_string());
+
+        fs::write(filename, asm.join("\n")).unwrap();
+    }
+}
+
+// --------------------------
+// Parser
+// --------------------------
+fn parse(input: &str) -> Vec<Statement> {
+    let mut statements = Vec::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+
+        if line.starts_with("if ") && line.ends_with(':') {
+            let condition = line[3..line.len()-1].trim().to_string();
+            i += 1;
+
+            let mut then_branch = Vec::new();
+            while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                then_branch.push(parse_statement(lines[i].trim()));
+                i += 1;
+            }
+
+            let mut elif_branches = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with("elif ") {
+                let elif_line = lines[i].trim();
+                let elif_cond = elif_line[5..elif_line.len()-1].trim().to_string();
+                i += 1;
+
+                let mut elif_body = Vec::new();
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                    elif_body.push(parse_statement(lines[i].trim()));
+                    i += 1;
+                }
+                elif_branches.push((elif_cond, elif_body));
+            }
+
+            let mut else_branch = None;
+            if i < lines.len() && lines[i].trim() == "else:" {
+                i += 1;
+                let mut else_body = Vec::new();
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                    else_body.push(parse_statement(lines[i].trim()));
+                    i += 1;
+                }
+                else_branch = Some(else_body);
+            }
+
+            statements.push(Statement::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            });
+        } else {
+            statements.push(parse_statement(line));
+            i += 1;
+        }
+    }
+
+    statements
+}
+
+fn parse_statement(line: &str) -> Statement {
+    if line.starts_with("print(") && line.ends_with(')') {
+        let args = line[6..line.len()-1]
+            .split(',')
+            .map(|s| s.trim().trim_matches('"').to_string())
+            .collect();
+        Statement::Print(args)
+    } else if line.contains('=') {
+        let mut parts = line.split('=');
+        let name = parts.next().unwrap().trim().to_string();
+        let expr = parts.next().unwrap().trim().to_string();
+        Statement::Assign(name, expr)
+    } else if line.ends_with("()") {
+        Statement::FunctionCall(line[..line.len()-2].to_string())
+    } else {
+        panic!("Unsupported statement: {}", line);
+    }
+}
+
+// --------------------------
+// Main
+// --------------------------
+fn main() {
+    let input = r#"
+x = 15
+y = 30
+
+if x > y:
+    print("x is greater")
+elif x == y:
+    print("both are equal")
+else:
+    print("x is smaller")
+print(chr(65), ord("A"))
+"#;
+
+    let statements = parse(input);
+    let mut compiler = Compiler::new();
+    compiler.compile(&statements);
+    compiler.save_asm("out.s");
+
+    // Assemble and link
+    Command::new("as")
+        .args(&["-o", "out.o", "out.s"])
+        .status()
+        .unwrap();
+
+    Command::new("ld")
+        .args(&["-o", "a.out", "out.o"])
+        .status()
+        .unwrap();
+
+    println!("✅ Compiled to a.out");
+}

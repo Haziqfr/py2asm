@@ -1,0 +1,449 @@
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::process::Command;
+use regex::Regex;
+
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    Str(String),
+    Char(char),
+}
+
+struct Compiler {
+    variables: HashMap<String, Value>,
+    functions: HashMap<String, Vec<String>>,
+    data_section: Vec<String>,
+    text_section: Vec<String>,
+    data_count: usize,
+}
+
+impl Compiler {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            data_section: vec![".data".to_string()],
+            text_section: vec![
+                "    .text".to_string(),
+                "    .global _start".to_string(),
+                "_start:".to_string(),
+            ],
+            data_count: 0,
+        }
+    }
+
+    fn add_data(&mut self, val: &str, add_newline: bool) -> String {
+        let label = format!("str{}", self.data_count);
+        self.data_count += 1;
+        
+        let mut real_str = String::new();
+        let mut chars = val.chars().peekable();
+        
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    match next {
+                        'n' => real_str.push('\n'),
+                        't' => real_str.push('\t'),
+                        'r' => real_str.push('\r'),
+                        '\\' => real_str.push('\\'),
+                        '"' => real_str.push('"'),
+                        'x' => {
+                            let hex_str: String = chars.next().into_iter().chain(chars.next()).collect();
+                            if hex_str.len() != 2 {
+                                panic!("Invalid hex escape sequence");
+                            }
+                            let byte = u8::from_str_radix(&hex_str, 16).expect("Invalid hex digit");
+                            real_str.push(byte as char);
+                        }
+                        'u' => {
+                            if chars.next() != Some('{') {
+                                panic!("Invalid unicode escape");
+                            }
+                            let hex_str: String = chars.by_ref().take_while(|&c| c != '}').collect();
+                            if hex_str.len() < 1 || hex_str.len() > 6 {
+                                panic!("Invalid unicode escape length");
+                            }
+                            let code = u32::from_str_radix(&hex_str, 16).expect("Invalid hex digit");
+                            real_str.push(char::from_u32(code).expect("Invalid Unicode code point"));
+                            if chars.next() != Some('}') {
+                                panic!("Missing closing brace in unicode escape");
+                            }
+                        }
+                        _ => real_str.push(next),
+                    }
+                } else {
+                    panic!("Incomplete escape sequence");
+                }
+            } else {
+                real_str.push(c);
+            }
+        }
+        
+        if add_newline {
+            real_str.push('\n');
+        }
+        
+        let bytes = real_str.into_bytes();
+        let mut bytes_str = Vec::new();
+        
+        for chunk in bytes.chunks(10) {
+            bytes_str.push(
+                chunk
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+            );
+        }
+        
+        self.data_section.push(format!("{}:", label));
+        for chunk in bytes_str {
+            self.data_section.push(format!("    .byte {}", chunk));
+        }
+        self.data_section.push(format!("{}_len = . - {}", label, label));
+        
+        label
+    }
+
+    fn emit_print(&mut self, label: &str) {
+        self.text_section.push("    mov x0, #1".to_string());
+        self.text_section.push(format!("    adr x1, {}", label));
+        self.text_section.push(format!("    mov x2, {}_len", label));
+        self.text_section.push("    mov x8, #64".to_string());
+        self.text_section.push("    svc #0".to_string());
+    }
+
+    fn eval_expr(&mut self, expr: &str, local_vars: &HashMap<String, Value>) -> Option<Value> {
+        let expr = expr.trim();
+        let chr_re = Regex::new(r"^chr\s*\(\s*(.+?)\s*\)$").unwrap();
+        let ord_re = Regex::new(r"^ord\s*\(\s*(.+?)\s*\)$").unwrap();
+        
+        if let Some(caps) = chr_re.captures(expr) {
+            if let Some(inner) = caps.get(1) {
+                let inner_val = self.eval_expr(inner.as_str(), local_vars)?;
+                if let Value::Int(n) = inner_val {
+                    return Some(Value::Char(char::from_u32(n as u32)?));
+                }
+            }
+        }
+        
+        if let Some(caps) = ord_re.captures(expr) {
+            if let Some(inner) = caps.get(1) {
+                let inner_val = self.eval_expr(inner.as_str(), local_vars)?;
+                match inner_val {
+                    Value::Char(c) => return Some(Value::Int(c as i64)),
+                    Value::Str(s) if s.len() == 1 => {
+                        return Some(Value::Int(s.chars().next().unwrap() as i64))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        if let Ok(n) = expr.parse::<i64>() {
+            return Some(Value::Int(n));
+        }
+        
+        if expr.starts_with('"') && expr.ends_with('"') {
+            return Some(Value::Str(expr[1..expr.len()-1].to_string()));
+        }
+        
+        if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() == 3 {
+            return Some(Value::Char(expr.chars().nth(1)?));
+        }
+        
+        if let Some(val) = self.variables.get(expr) {
+            return Some(val.clone());
+        }
+        
+        if let Some(val) = local_vars.get(expr) {
+            return Some(val.clone());
+        }
+        
+        None
+    }
+
+    fn compile_lines(&mut self, lines: &[String], local_vars: HashMap<String, Value>) {
+        let mut i = 0;
+        let if_re = Regex::new(r"^if\s+(.+)\s*:$").unwrap();
+        let elif_re = Regex::new(r"^elif\s+(.+)\s*:$").unwrap();
+        let else_re = Regex::new(r"^else\s*:$").unwrap();
+        
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if line.is_empty() || line.starts_with('#') {
+                i += 1;
+                continue;
+            }
+            
+            // Handle conditionals
+            if let Some(caps) = if_re.captures(line) {
+                let condition = caps.get(1).unwrap().as_str().to_string();
+                i += 1;
+                let mut then_branch = vec![];
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                    then_branch.push(lines[i].trim().to_string());
+                    i += 1;
+                }
+                
+                let mut elif_branches = vec![];
+                let mut else_branch = None;
+                
+                while i < lines.len() {
+                    let line = lines[i].trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        i += 1;
+                        continue;
+                    }
+                    
+                    if let Some(caps) = elif_re.captures(line) {
+                        let cond = caps.get(1).unwrap().as_str().to_string();
+                        i += 1;
+                        let mut branch = vec![];
+                        while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                            branch.push(lines[i].trim().to_string());
+                            i += 1;
+                        }
+                        elif_branches.push((cond, branch));
+                    } else if else_re.is_match(line) {
+                        i += 1;
+                        let mut branch = vec![];
+                        while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                            branch.push(lines[i].trim().to_string());
+                            i += 1;
+                        }
+                        else_branch = Some(branch);
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                
+                // Evaluate condition and compile the appropriate branch
+                let mut compiled = false;
+                
+                // Evaluate if condition
+                if let Some(cond_val) = self.eval_condition(&condition, &local_vars) {
+                    if cond_val {
+                        self.compile_lines(&then_branch, local_vars.clone());
+                        compiled = true;
+                    }
+                }
+                
+                // Evaluate elif conditions
+                if !compiled {
+                    for (cond, branch) in &elif_branches {
+                        if let Some(cond_val) = self.eval_condition(cond, &local_vars) {
+                            if cond_val {
+                                self.compile_lines(branch, local_vars.clone());
+                                compiled = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Compile else branch if needed
+                if !compiled {
+                    if let Some(branch) = else_branch {
+                        self.compile_lines(&branch, local_vars.clone());
+                    }
+                }
+                continue;
+            }
+            
+            // Variable assignment
+            if line.contains('=') && !line.starts_with("print") && !line.starts_with("def") && !line.ends_with("()") {
+                let parts: Vec<&str> = line.splitn(2, '=').collect();
+                if parts.len() != 2 {
+                    panic!("❌ Invalid assignment: {}", line);
+                }
+                
+                let name = parts[0].trim();
+                let expr = parts[1].trim();
+                
+                let val = if (expr.starts_with('"') && expr.ends_with('"')) || 
+                             (expr.starts_with('\'') && expr.ends_with('\'')) {
+                    Value::Str(expr[1..expr.len()-1].to_string())
+                } else {
+                    match self.eval_expr(expr, &local_vars) {
+                        Some(v) => v,
+                        None => panic!("❌ Unknown or invalid expression for variable '{}': {}", name, expr),
+                    }
+                };
+                
+                self.variables.insert(name.to_string(), val);
+                i += 1;
+                continue;
+            }
+            
+            // Print statement
+            if line.starts_with("print(") && line.ends_with(')') {
+                let args_str = line[6..line.len()-1].trim();
+                let args: Vec<&str> = if args_str.is_empty() {
+                    vec![]
+                } else {
+                    args_str.split(',').map(|s| s.trim()).collect()
+                };
+                
+                let mut combined_str = String::new();
+                for arg in args {
+                    let val = if (arg.starts_with('"') && arg.ends_with('"')) || 
+                                 (arg.starts_with('\'') && arg.ends_with('\'')) {
+                        Value::Str(arg[1..arg.len()-1].to_string())
+                    } else {
+                        match self.eval_expr(arg, &local_vars) {
+                            Some(v) => v,
+                            None => panic!("❌ Unknown variable or invalid expression in print: {}", arg),
+                        }
+                    };
+                    
+                    let val_str = match val {
+                        Value::Int(n) => n.to_string(),
+                        Value::Str(s) => s,
+                        Value::Char(c) => c.to_string(),
+                    };
+                    
+                    if !combined_str.is_empty() {
+                        combined_str.push(' ');
+                    }
+                    combined_str.push_str(&val_str);
+                }
+                
+                let label = self.add_data(&combined_str, true);
+                self.emit_print(&label);
+                i += 1;
+                continue;
+            }
+            
+            // Function call
+            if line.ends_with("()") {
+                let func_name = line[..line.len()-2].trim();
+                if !self.functions.contains_key(func_name) {
+                    panic!("❌ Call to undefined function: {}", func_name);
+                }
+                
+                let body = self.functions.get(func_name).unwrap().clone();
+                let mut new_local_vars = local_vars.clone();
+                new_local_vars.extend(self.variables.clone());
+                
+                self.compile_lines(&body, new_local_vars);
+                i += 1;
+                continue;
+            }
+            
+            panic!("❌ Unsupported or unknown line: {}", line);
+        }
+    }
+    
+    fn eval_condition(&mut self, expr: &str, local_vars: &HashMap<String, Value>) -> Option<bool> {
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() == 1 {
+            // Single variable - check truthiness
+            if let Some(val) = self.eval_expr(parts[0], local_vars) {
+                return match val {
+                    Value::Int(n) => Some(n != 0),
+                    Value::Str(s) => Some(!s.is_empty()),
+                    Value::Char(_) => Some(true),
+                };
+            }
+        } else if parts.len() == 3 {
+            let left = self.eval_expr(parts[0], local_vars)?;
+            let right = self.eval_expr(parts[2], local_vars)?;
+            let op = parts[1];
+            
+            return match (left, op, right) {
+                (Value::Int(a), ">", Value::Int(b)) => Some(a > b),
+                (Value::Int(a), "<", Value::Int(b)) => Some(a < b),
+                (Value::Int(a), "==", Value::Int(b)) => Some(a == b),
+                (Value::Int(a), "!=", Value::Int(b)) => Some(a != b),
+                (Value::Int(a), ">=", Value::Int(b)) => Some(a >= b),
+                (Value::Int(a), "<=", Value::Int(b)) => Some(a <= b),
+                (Value::Str(a), "==", Value::Str(b)) => Some(a == b),
+                (Value::Str(a), "!=", Value::Str(b)) => Some(a != b),
+                _ => None,
+            };
+        }
+        
+        None
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <input.py> [-o output]", args[0]);
+        return;
+    }
+
+    let input_file = &args[1];
+    let output_file = if args.len() >= 4 && args[2] == "-o" {
+        &args[3]
+    } else {
+        "a.out"
+    };
+
+    let input = fs::read_to_string(input_file).unwrap_or_else(|_| {
+        panic!("Failed to read input file: {}", input_file);
+    });
+    
+    let raw_lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
+    let mut compiler = Compiler::new();
+    
+    let mut i = 0;
+    while i < raw_lines.len() {
+        let line = raw_lines[i].trim();
+        if line.is_empty() || line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        
+        if line.starts_with("def ") && line.ends_with("():") {
+            let func_name = line[4..line.len()-3].trim().to_string();
+            i += 1;
+            let mut func_body = Vec::new();
+            
+            while i < raw_lines.len() {
+                let next_line = &raw_lines[i];
+                if next_line.starts_with("    ") {
+                    func_body.push(next_line[4..].to_string());
+                    i += 1;
+                } else if next_line.trim().is_empty() {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            
+            compiler.functions.insert(func_name, func_body);
+        } else {
+            compiler.compile_lines(&[line.to_string()], HashMap::new());
+            i += 1;
+        }
+    }
+    
+    compiler.text_section.push("    mov x0, #0".to_string());
+    compiler.text_section.push("    mov x8, #93".to_string());
+    compiler.text_section.push("    svc #0".to_string());
+    
+    let mut asm = compiler.data_section;
+    asm.push("".to_string());
+    asm.extend(compiler.text_section);
+    
+    fs::write("out.s", asm.join("\n")).expect("Failed to write assembly");
+    
+    Command::new("as")
+        .args(["-o", "out.o", "out.s"])
+        .status()
+        .expect("Failed to assemble");
+    
+    Command::new("ld")
+        .args(["-o", output_file, "out.o"])
+        .status()
+        .expect("Failed to link");
+    
+    println!("✅ Compiled to {}", output_file);
+}

@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+import re
+
+# --------------------------
+# Utility Functions
+# --------------------------
+def error(msg):
+    print(f"❌ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def is_control_flow(line):
+    return any(line.startswith(x) for x in ["if ", "elif ", "else:"])
+
+# --------------------------
+# Compiler State
+# --------------------------
+class CompilerState:
+    def __init__(self):
+        self.data_section = []
+        self.text_section = [
+            "    .text",
+            "    .global _start",
+            "_start:"
+        ]
+        self.variables = {}
+        self.functions = {}
+        self.data_count = 0
+        self.label_count = 0
+
+    def new_label(self, prefix="L"):
+        label = f"{prefix}{self.label_count}"
+        self.label_count += 1
+        return label
+
+    def add_data(self, val, add_newline=True):
+        """Add string data to the data section"""
+        label = f"str{self.data_count}"
+        real_str = val.encode('utf-8').decode('unicode_escape')
+        if add_newline:
+            real_str += "\n"
+        
+        bytes_list = [str(b) for b in real_str.encode('utf-8')]
+        self.data_section.append(f"{label}:")
+        
+        # Split into chunks of 10 bytes per line
+        for i in range(0, len(bytes_list), 10):
+            chunk = bytes_list[i:i+10]
+            self.data_section.append("    .byte " + ", ".join(chunk))
+        
+        self.data_section.append(f"{label}_len = . - {label}")
+        self.data_count += 1
+        return label
+
+# --------------------------
+# Expression Handling
+# --------------------------
+def eval_expr(expr, variables):
+    """Evaluate a Python expression with variable substitution"""
+    expr = expr.strip()
+    
+    # Handle chr() and ord()
+    if expr.startswith("chr(") and expr.endswith(")"):
+        val = eval_expr(expr[4:-1], variables)
+        return chr(int(val)) if val is not None else None
+    elif expr.startswith("ord(") and expr.endswith(")"):
+        val = expr[4:-1].strip('"\'')
+        return ord(val[0]) if val else None
+    
+    # Substitute variables
+    def replace_var(match):
+        var = match.group(0)
+        if var in variables:
+            val = variables[var]
+            if isinstance(val, str):
+                return f'"{val}"'
+            return str(val)
+        return var
+    
+    # Handle comparison operators
+    if any(op in expr for op in ['>', '<', '==', '!=', '>=', '<=']):
+        # Replace variables in both sides of comparison
+        left, op, right = re.split(r'([><=!]+)', expr, 1)
+        left = re.sub(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', replace_var, left.strip())
+        right = re.sub(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', replace_var, right.strip())
+        expr = f"{left}{op}{right}"
+    
+    # General expression evaluation
+    expr = re.sub(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', replace_var, expr)
+    
+    try:
+        result = eval(expr, {"__builtins__": None}, {})
+        # Convert numbers to booleans for conditions
+        if isinstance(result, (int, float)):
+            return bool(result)
+        return result
+    except:
+        return None
+
+# --------------------------
+# Conditional Compilation
+# --------------------------
+def compile_condition(state, condition, variables):
+    """Compile a condition and return the label for the false branch"""
+    false_label = state.new_label("false_")
+    true_label = state.new_label("true_")
+    
+    # Evaluate condition
+    val = eval_expr(condition, variables)
+    if not isinstance(val, bool):
+        error(f"Condition must evaluate to boolean: {condition}")
+    
+    # Jump to false branch if condition is false
+    state.text_section.extend([
+        f"    // if {condition}",
+        f"    mov x0, #{int(val)}",
+        f"    cmp x0, #1",
+        f"    b.ne {false_label}",
+    ])
+    
+    return false_label, true_label
+
+def compile_conditional(state, lines, start_idx, variables):
+    """Compile if-elif-else blocks"""
+    idx = start_idx
+    conditions = []
+    blocks = []
+    end_labels = []
+    
+    # Parse the initial if block
+    if_line = lines[idx].strip()
+    if not if_line.startswith("if ") or not if_line.endswith(":"):
+        error("Malformed if statement")
+    
+    condition = if_line[3:-1].strip()
+    idx += 1
+    
+    # Parse the if block
+    if_block = []
+    while idx < len(lines) and (lines[idx].startswith("    ") or lines[idx].startswith("\t")):
+        if_block.append(lines[idx][4:].lstrip())
+        idx += 1
+    
+    conditions.append(condition)
+    blocks.append(if_block)
+    
+    # Parse elif/else blocks
+    while idx < len(lines):
+        line = lines[idx].strip()
+        
+        if line.startswith("elif ") and line.endswith(":"):
+            condition = line[5:-1].strip()
+            idx += 1
+            
+            block = []
+            while idx < len(lines) and (lines[idx].startswith("    ") or lines[idx].startswith("\t")):
+                block.append(lines[idx][4:].lstrip())
+                idx += 1
+            
+            conditions.append(condition)
+            blocks.append(block)
+        
+        elif line == "else:":
+            idx += 1
+            
+            block = []
+            while idx < len(lines) and (lines[idx].startswith("    ") or lines[idx].startswith("\t")):
+                block.append(lines[idx][4:].lstrip())
+                idx += 1
+            
+            conditions.append("True")  # else is always true
+            blocks.append(block)
+            break
+        
+        else:
+            break
+    
+    # Generate labels
+    end_label = state.new_label("end_if_")
+    
+    # Compile each condition and block
+    for i, (cond, block) in enumerate(zip(conditions, blocks)):
+        false_label = state.new_label("false_") if i < len(conditions)-1 else end_label
+        
+        # For elif/else, we need to jump here from previous false branch
+        if i > 0:
+            state.text_section.append(f"{end_labels[-1]}:")
+        
+        # Compile the condition
+        if cond != "True":  # Skip for else block
+            val = eval_expr(cond, variables)
+            if not isinstance(val, bool):
+                error(f"Condition must evaluate to boolean: {cond}")
+            
+            state.text_section.extend([
+                f"    // {'elif' if i > 0 else 'if'} {cond}",
+                f"    mov x0, #{int(val)}",
+                f"    cmp x0, #1",
+                f"    b.ne {false_label}",
+            ])
+        
+        # Compile the block
+        compile_lines(state, block, variables.copy())
+        
+        # Jump to end after true block
+        if i < len(conditions)-1:
+            state.text_section.append(f"    b {end_label}")
+            end_labels.append(false_label)
+    
+    state.text_section.append(f"{end_label}:")
+    return idx
+
+# --------------------------
+# Main Compilation
+# --------------------------
+def compile_lines(state, lines, variables):
+    """Compile a series of lines"""
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Skip empty lines and comments
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+        
+        # Handle if-elif-else
+        if line.startswith("if ") and line.endswith(":"):
+            i = compile_conditional(state, lines, i, variables)
+            continue
+        
+        # Variable assignment
+        if "=" in line and not is_control_flow(line):
+            parts = [p.strip() for p in line.split("=", 1)]
+            if len(parts) != 2:
+                error(f"Invalid assignment: {line}")
+            
+            name, expr = parts
+            if expr.startswith(('"', "'")):
+                val = expr[1:-1]
+            else:
+                val = eval_expr(expr, variables)
+                if val is None:
+                    error(f"Unknown expression: {expr}")
+            
+            variables[name] = val
+            i += 1
+            continue
+        
+        # Print statement
+        if line.startswith("print(") and line.endswith(")"):
+            args = [a.strip() for a in line[6:-1].split(",")]
+            output = []
+            
+            for arg in args:
+                if arg.startswith(('"', "'")):
+                    output.append(arg[1:-1])
+                else:
+                    val = eval_expr(arg, variables)
+                    if val is None:
+                        error(f"Unknown expression in print: {arg}")
+                    output.append(str(val))
+            
+            label = state.add_data(" ".join(output))
+            state.text_section.extend([
+                f"    // print {' '.join(output)}",
+                f"    mov x0, #1",
+                f"    adr x1, {label}",
+                f"    mov x2, {label}_len",
+                f"    mov x8, #64",
+                f"    svc #0"
+            ])
+            i += 1
+            continue
+        
+        # Function call
+        if line.endswith("()"):
+            func_name = line[:-2]
+            if func_name not in state.functions:
+                error(f"Undefined function: {func_name}")
+            compile_lines(state, state.functions[func_name], variables.copy())
+            i += 1
+            continue
+        
+        error(f"Unsupported statement: {line}")
+
+# --------------------------
+# Main Function
+# --------------------------
+def main():
+    if len(sys.argv) < 2:
+        error("Usage: compiler <input.py> [-o <output>]")
+    
+    input_file = sys.argv[1]
+    output_file = "a.out"
+    
+    if "-o" in sys.argv:
+        idx = sys.argv.index("-o")
+        if idx + 1 < len(sys.argv):
+            output_file = sys.argv[idx + 1]
+        else:
+            error("Output file not specified after -o")
+    
+    with open(input_file) as f:
+        lines = [line.rstrip() for line in f]
+    
+    state = CompilerState()
+    i = 0
+    
+    # First pass: collect functions
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("def ") and line.endswith("():"):
+            func_name = line[4:-3].strip()
+            i += 1
+            func_body = []
+            
+            while i < len(lines) and (lines[i].startswith("    ") or lines[i].startswith("\t")):
+                func_body.append(lines[i][4:].lstrip())
+                i += 1
+            
+            state.functions[func_name] = func_body
+        else:
+            i += 1
+    
+    # Second pass: compile main code
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("def "):
+            compile_lines(state, [lines[i]], state.variables.copy())
+        i += 1
+    
+    # Add program exit
+    state.text_section.extend([
+        "    // Exit",
+        "    mov x0, #0",
+        "    mov x8, #93",
+        "    svc #0"
+    ])
+    
+    # Generate assembly
+    asm = [".data"] + state.data_section + [""] + state.text_section
+    
+    with open("out.s", "w") as f:
+        f.write("\n".join(asm) + "\n")
+    
+    # Assemble and link
+    subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+    subprocess.run(["ld", "-o", output_file, "out.o"], check=True)
+    
+    print(f"✅ Compiled to {output_file}")
+
+if __name__ == "__main__":
+    main()

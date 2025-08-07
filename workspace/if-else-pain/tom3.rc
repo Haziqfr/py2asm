@@ -1,0 +1,233 @@
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    Str(String),
+    Char(char),
+}
+
+struct Compiler {
+    variables: HashMap<String, Value>,
+    functions: HashMap<String, Vec<String>>,
+    data_section: Vec<String>,
+    text_section: Vec<String>,
+    data_count: usize,
+    label_counter: usize,
+}
+
+impl Compiler {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            data_section: vec![".data".to_string()],
+            text_section: vec![
+                "    .text",
+                "    .global _start",
+                "_start:",
+            ].iter().map(|s| s.to_string()).collect(),
+            data_count: 0,
+            label_counter: 0,
+        }
+    }
+
+    fn new_label(&mut self) -> String {
+        let label = format!("L{}", self.label_counter);
+        self.label_counter += 1;
+        label
+    }
+
+    fn add_data(&mut self, val: &str) -> String {
+        let label = format!("str{}", self.data_count);
+        let escaped = val.replace('\\', "\\\\").replace('"', "\\\"");
+        self.data_section.push(format!("{}:", label));
+        self.data_section.push(format!("    .ascii \"{}\"", escaped));
+        self.data_section.push(format!("{}_len = . - {}", label, label));
+        self.data_count += 1;
+        label
+    }
+
+    fn emit_print(&mut self, val: &str) {
+        let label = self.add_data(val);
+        self.text_section.extend(vec![
+            format!("    // print {}", val),
+            "    mov x0, #1".to_string(),
+            format!("    adr x1, {}", label),
+            format!("    mov x2, {}_len", label),
+            "    mov x8, #64".to_string(),
+            "    svc #0".to_string(),
+        ]);
+    }
+
+    fn eval_expr(&self, expr: &str) -> Option<Value> {
+        let expr = expr.trim();
+        
+        // Handle chr()
+        if let Some(inner) = expr.strip_prefix("chr(").and_then(|s| s.strip_suffix(")")) {
+            if let Some(Value::Int(n)) = self.eval_expr(inner) {
+                return char::from_u32(n as u32).map(Value::Char);
+            }
+        }
+        
+        // Handle ord()
+        if let Some(inner) = expr.strip_prefix("ord(").and_then(|s| s.strip_suffix(")")) {
+            if let Some(val) = self.eval_expr(inner) {
+                match val {
+                    Value::Char(c) => return Some(Value::Int(c as i64)),
+                    Value::Str(s) if s.len() == 1 => return Some(Value::Int(s.chars().next()? as i64)),
+                    _ => (),
+                }
+            }
+        }
+
+        if let Ok(n) = expr.parse::<i64>() {
+            return Some(Value::Int(n));
+        }
+
+        if let Some(s) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            return Some(Value::Str(s.to_string()));
+        }
+
+        if let Some(c) = expr.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            if c.len() == 1 {
+                return Some(Value::Char(c.chars().next()?));
+            }
+        }
+
+        self.variables.get(expr).cloned()
+    }
+
+    fn eval_condition(&self, cond: &str) -> bool {
+        let parts: Vec<&str> = cond.split_whitespace().collect();
+        if parts.len() != 3 {
+            panic!("Invalid condition: {}", cond);
+        }
+
+        let left = self.eval_expr(parts[0]).expect("Unknown left operand");
+        let right = self.eval_expr(parts[2]).expect("Unknown right operand");
+        let op = parts[1];
+
+        match (left, op, right) {
+            (Value::Int(a), ">", Value::Int(b)) => a > b,
+            (Value::Int(a), "<", Value::Int(b)) => a < b,
+            (Value::Int(a), "==", Value::Int(b)) => a == b,
+            _ => panic!("Unsupported comparison: {} {} {}", parts[0], op, parts[2]),
+        }
+    }
+
+    fn compile(&mut self, lines: &[String]) {
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if line.is_empty() || line.starts_with('#') {
+                i += 1;
+                continue;
+            }
+
+            // Handle if statements
+            if let Some(cond) = line.strip_prefix("if ").and_then(|s| s.strip_suffix(':')) {
+                let end_label = self.new_label();
+                let else_label = self.new_label();
+
+                // Compile condition
+                if !self.eval_condition(cond) {
+                    self.text_section.push(format!("    b {}", else_label));
+                }
+
+                // Compile then branch
+                i += 1;
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].is_empty()) {
+                    let trimmed = lines[i].trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        self.compile(&[trimmed.to_string()]);
+                    }
+                    i += 1;
+                }
+
+                // Look for else
+                if i < lines.len() && lines[i].trim() == "else:" {
+                    self.text_section.push(format!("    b {}", end_label));
+                    self.text_section.push(format!("{}:", else_label));
+                    i += 1;
+                    while i < lines.len() && (lines[i].starts_with("    ") || lines[i].is_empty()) {
+                        let trimmed = lines[i].trim();
+                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                            self.compile(&[trimmed.to_string()]);
+                        }
+                        i += 1;
+                    }
+                    self.text_section.push(format!("{}:", end_label));
+                } else {
+                    self.text_section.push(format!("{}:", else_label));
+                }
+                continue;
+            }
+
+            // Handle variable assignment
+            if let Some((name, expr)) = line.split_once('=') {
+                let name = name.trim();
+                let expr = expr.trim();
+                if let Some(val) = self.eval_expr(expr) {
+                    self.variables.insert(name.to_string(), val);
+                }
+                i += 1;
+                continue;
+            }
+
+            // Handle print
+            if let Some(args) = line.strip_prefix("print(").and_then(|s| s.strip_suffix(")")) {
+                let args = args.split(',').map(|s| s.trim().trim_matches('"')).collect::<Vec<_>>().join(" ");
+                self.emit_print(&args);
+                i += 1;
+                continue;
+            }
+
+            // Handle function calls
+            if line.ends_with("()") {
+                let func_name = line.trim_end_matches("()");
+                if let Some(body) = self.functions.get(func_name) {
+                    let mut temp = self.clone();
+                    temp.compile(body);
+                    *self = temp;
+                }
+                i += 1;
+                continue;
+            }
+
+            panic!("Unsupported statement: {}", line);
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <input.py>", args[0]);
+        return;
+    }
+
+    let input = fs::read_to_string(&args[1]).expect("Failed to read input");
+    let lines: Vec<String> = input.lines().map(|s| s.to_string()).collect();
+
+    let mut compiler = Compiler::new();
+    compiler.compile(&lines);
+
+    // Generate output
+    let mut asm = compiler.data_section;
+    asm.push("".to_string());
+    asm.extend(compiler.text_section);
+    asm.extend(vec![
+        "    // Exit",
+        "    mov x0, #0",
+        "    mov x8, #93",
+        "    svc #0",
+    ].iter().map(|s| s.to_string()).collect::<Vec<String>>());
+
+    fs::write("out.s", asm.join("\n")).expect("Failed to write asm");
+    Command::new("as").args(["out.s", "-o", "out.o"]).status().unwrap();
+    Command::new("ld").args(["out.o", "-o", "a.out"]).status().unwrap();
+}

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+import re
+
+if len(sys.argv) < 2:
+    print("Usage: compiler <input.py> [-o <output>]")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = "a.out"
+if "-o" in sys.argv:
+    o_index = sys.argv.index("-o")
+    if o_index + 1 < len(sys.argv):
+        output_file = sys.argv[o_index + 1]
+    else:
+        print("❌ Output file not specified after -o")
+        sys.exit(1)
+
+with open(input_file) as f:
+    raw_lines = f.readlines()
+
+lines = [line.rstrip('\n') for line in raw_lines]
+data_section = []
+text_section = [
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+functions = {}
+data_count = 0
+label_count = 0
+
+def new_label():
+    global label_count
+    label_count += 1
+    return f"L{label_count}"
+
+def add_data(val, add_newline=True):
+    global data_count, data_section
+    label = f"str{data_count}"
+    real_str = val
+    if add_newline:
+        real_str += "\n"
+
+    bytes_list = [str(b) for b in real_str.encode('utf-8')]
+
+    data_section.append(f"{label}:")
+    for i in range(0, len(bytes_list), 10):
+        chunk = bytes_list[i:i+10]
+        data_section.append("    .byte " + ", ".join(chunk))
+    data_section.append(f"{label}_len = . - {label}")
+
+    data_count += 1
+    return label
+
+def emit_print(label):
+    return [
+        "    mov x0, #1",
+        f"    adr x1, {label}",
+        f"    mov x2, {label}_len",
+        "    mov x8, #64",
+        "    svc #0"
+    ]
+
+def is_indented(line):
+    return line.startswith("    ") or line.startswith("\t")
+
+def remove_indent(line):
+    if line.startswith("    "):
+        return line[4:]
+    elif line.startswith("\t"):
+        return line[1:]
+    return line
+
+def compile_conditional_block(lines, start_index, local_vars):
+    global text_section  # Access global text_section
+    branches = []
+    i = start_index
+    end_label = new_label()
+
+    def parse_condition(line):
+        line = line.strip()
+        if line.startswith("if "):
+            return line[3:-1].strip()
+        elif line.startswith("elif "):
+            return line[5:-1].strip()
+        elif line == "else:":
+            return None
+        return "INVALID"
+
+    # Parse initial if/elif/else
+    cond_expr = parse_condition(lines[i])
+    if cond_expr == "INVALID":
+        print(f"❌ Invalid conditional statement: {lines[i]}")
+        sys.exit(1)
+    
+    # Generate assembly for condition
+    false_label = new_label()
+    text_section.append(f"    // Condition: {cond_expr}")
+    
+    # This is where we'd generate actual comparison code
+    # For now, we'll just assume it evaluates to true/false
+    text_section.append(f"    // Compare x and y")
+    text_section.append(f"    ldr x0, =x")
+    text_section.append(f"    ldr w1, [x0]")
+    text_section.append(f"    ldr x0, =y")
+    text_section.append(f"    ldr w2, [x0]")
+    text_section.append(f"    cmp w1, w2")
+    
+    if ">" in cond_expr:
+        text_section.append(f"    ble {false_label}")
+    elif "==" in cond_expr:
+        text_section.append(f"    bne {false_label}")
+    else:
+        text_section.append(f"    b {false_label}")
+
+    i += 1
+    block_lines = []
+    while i < len(lines) and is_indented(lines[i]):
+        block_lines.append(remove_indent(lines[i]))
+        i += 1
+    branches.append((cond_expr, block_lines, false_label))
+
+    # Parse additional elif/else clauses
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("elif ") and line.endswith(":"):
+            cond_expr = parse_condition(line)
+            false_label = new_label()
+            text_section.append(f"{false_label}:")
+            text_section.append(f"    // Condition: {cond_expr}")
+            text_section.append(f"    // Compare x and y")
+            text_section.append(f"    ldr x0, =x")
+            text_section.append(f"    ldr w1, [x0]")
+            text_section.append(f"    ldr x0, =y")
+            text_section.append(f"    ldr w2, [x0]")
+            text_section.append(f"    cmp w1, w2")
+            
+            if "==" in cond_expr:
+                text_section.append(f"    bne {false_label}")
+            else:
+                text_section.append(f"    b {false_label}")
+                
+            i += 1
+            block_lines = []
+            while i < len(lines) and is_indented(lines[i]):
+                block_lines.append(remove_indent(lines[i]))
+                i += 1
+            branches.append((cond_expr, block_lines, false_label))
+        elif line == "else:":
+            cond_expr = parse_condition(line)
+            false_label = new_label()
+            text_section.append(f"{false_label}:")
+            i += 1
+            block_lines = []
+            while i < len(lines) and is_indented(lines[i]):
+                block_lines.append(remove_indent(lines[i]))
+                i += 1
+            branches.append((cond_expr, block_lines, None))
+            break
+        else:
+            break
+
+    # Generate assembly for branches
+    for idx, (cond, blk, next_label) in enumerate(branches):
+        if cond is not None:
+            # This is an if or elif branch
+            text_section.append(f"    // True branch for: {cond}")
+            compile_lines(blk, local_vars)
+            text_section.append(f"    b {end_label}")
+            if next_label:
+                text_section.append(f"{next_label}:")
+        else:
+            # This is the else branch
+            text_section.append("    // Else branch")
+            compile_lines(blk, local_vars)
+    
+    text_section.append(f"{end_label}:")
+    return i
+
+def compile_print_statement(args):
+    global text_section  # Access global text_section
+    # For each argument, add its string to the data section
+    for arg in args:
+        arg = arg.strip()
+        if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+            val = arg[1:-1]
+        elif arg.startswith("chr(") and arg.endswith(")"):
+            # Convert chr() to character
+            char_code = int(arg[4:-1].strip())
+            val = chr(char_code)
+        elif arg.startswith("ord(") and arg.endswith(")"):
+            # Convert ord() to number string
+            char_str = arg[4:-1].strip()[1:-1]
+            val = str(ord(char_str))
+        else:
+            # Assume it's a variable name
+            val = arg
+        
+        label = add_data(val, add_newline=False)
+        text_section.extend(emit_print(label))  # Use extend instead of +=
+        
+        # Add space between arguments
+        if arg != args[-1]:
+            space_label = add_data(" ", add_newline=False)
+            text_section.extend(emit_print(space_label))
+    
+    # Add newline at end
+    newline_label = add_data("\n", add_newline=False)
+    text_section.extend(emit_print(newline_label))
+
+def compile_lines(lines_to_compile, local_vars):
+    global text_section, variables  # Access global text_section
+    i = 0
+    while i < len(lines_to_compile):
+        line = lines_to_compile[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+
+        # Handle conditional blocks
+        if stripped.startswith(("if ", "elif ", "else:")):
+            i = compile_conditional_block(lines_to_compile, i, local_vars)
+            continue
+
+        # Variable assignment
+        if "=" in stripped and not any(stripped.startswith(x) for x in ["print", "def"]) and not stripped.endswith("()"):
+            name, expr = [x.strip() for x in stripped.split("=", 1)]
+            
+            # Add variable to data section
+            if name not in variables:
+                data_section.append(f"{name}: .word 0")
+            
+            # Store value in variable
+            try:
+                val = int(expr)
+                text_section.append(f"    // Assign {name} = {val}")
+                text_section.append(f"    ldr x0, ={name}")
+                text_section.append(f"    mov w1, #{val}")
+                text_section.append(f"    str w1, [x0]")
+            except ValueError:
+                # For now, just handle integer values
+                print(f"❌ Only integer assignments are supported: {name} = {expr}")
+                sys.exit(1)
+                
+            variables[name] = val
+            i += 1
+            continue
+        
+        # print statement
+        if stripped.startswith("print(") and stripped.endswith(")"):
+            args = stripped[6:-1].split(",")
+            text_section.append(f"    // Print: {stripped}")
+            compile_print_statement(args)
+            i += 1
+            continue
+
+        # function call
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\(\s*\)\s*$', stripped):
+            func_name = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\)\s*$', stripped).group(1)
+            if func_name not in functions:
+                print(f"❌ Undefined function: {func_name}")
+                sys.exit(1)
+            compile_lines(functions[func_name], {**variables, **local_vars})
+            i += 1
+            continue
+
+        print(f"❌ Unsupported line: {line}")
+        sys.exit(1)
+
+# Main compilation loop
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if line.strip().startswith("def ") and line.strip().endswith("():"):
+        func_name = line.strip()[4:-3].strip()
+        i += 1
+        func_body = []
+        while i < len(lines) and is_indented(lines[i]):
+            func_body.append(remove_indent(lines[i]))
+            i += 1
+        functions[func_name] = func_body
+    else:
+        compile_lines([line], variables)
+        i += 1
+
+# Add program exit
+text_section += [
+    "    mov x0, #0",
+    "    mov x8, #93",
+    "    svc #0"
+]
+
+# Add variables to data section
+for var in variables:
+    if f"{var}: .word 0" not in data_section:
+        data_section.append(f"{var}: .word 0")
+
+# Generate assembly
+asm = [".data"] + data_section + [""] + text_section
+with open("out.s", "w") as f:
+    f.write("\n".join(asm) + "\n")
+
+# Assemble and link
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+print(f"✅ Compiled to {output_file}")

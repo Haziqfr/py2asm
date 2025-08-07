@@ -1,0 +1,322 @@
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+enum Value {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone)]
+enum Statement {
+    If {
+        condition: String,
+        then_branch: Vec<Statement>,
+        elif_branches: Vec<(String, Vec<Statement>)>,
+        else_branch: Option<Vec<Statement>>,
+    },
+    Print(Vec<String>),
+    Assign(String, String),
+    FunctionCall(String),
+    Comment,  // For commented lines
+}
+
+struct Compiler {
+    variables: HashMap<String, Value>,
+    functions: HashMap<String, Vec<Statement>>,
+    data_section: Vec<String>,
+    text_section: Vec<String>,
+    label_counter: usize,
+}
+
+impl Compiler {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            functions: HashMap::new(),
+            data_section: vec![".data".to_string()],
+            text_section: vec![
+                "    .text".to_string(),
+                "    .global _start".to_string(),
+                "_start:".to_string(),
+            ],
+            label_counter: 0,
+        }
+    }
+
+    fn new_label(&mut self, prefix: &str) -> String {
+        let label = format!("{}{}", prefix, self.label_counter);
+        self.label_counter += 1;
+        label
+    }
+
+    fn add_data(&mut self, val: &str, add_newline: bool) -> String {
+        let label = format!("str{}", self.data_section.len());
+        let mut escaped = val.replace('"', "\\\"");
+        if add_newline {
+            escaped.push_str("\\n");
+        }
+        
+        self.data_section.push(format!("{}:", label));
+        self.data_section.push(format!("    .ascii \"{}\"", escaped));
+        self.data_section.push(format!("{}_len = . - {}", label, label));
+        
+        label
+    }
+
+    fn eval_condition(&self, expr: &str) -> bool {
+        let parts: Vec<&str> = expr.split_whitespace().collect();
+        if parts.len() != 3 {
+            panic!("Invalid condition: {}", expr);
+        }
+
+        let left = self.eval_expr(parts[0]);
+        let right = self.eval_expr(parts[2]);
+        let op = parts[1];
+
+        match (left, op, right) {
+            (Value::Int(a), ">", Value::Int(b)) => a > b,
+            (Value::Int(a), "<", Value::Int(b)) => a < b,
+            (Value::Int(a), "==", Value::Int(b)) => a == b,
+            _ => panic!("Unsupported comparison: {} {} {}", parts[0], op, parts[2]),
+        }
+    }
+
+    fn eval_expr(&self, expr: &str) -> Value {
+        // Handle chr() and ord()
+        if expr.starts_with("chr(") && expr.ends_with(')') {
+            if let Value::Int(n) = self.eval_expr(&expr[4..expr.len()-1]) {
+                return Value::Str((n as u8 as char).to_string());
+            }
+        } else if expr.starts_with("ord(") && expr.ends_with(')') {
+            let s = expr[4..expr.len()-1].trim_matches('"');
+            if s.len() == 1 {
+                return Value::Int(s.chars().next().unwrap() as i64);
+            }
+        }
+
+        // Handle numbers
+        if let Ok(num) = expr.parse::<i64>() {
+            return Value::Int(num);
+        }
+
+        // Handle strings
+        if expr.starts_with('"') && expr.ends_with('"') {
+            return Value::Str(expr[1..expr.len()-1].to_string());
+        }
+
+        // Handle variables
+        if let Some(val) = self.variables.get(expr) {
+            return val.clone();
+        }
+
+        panic!("Unknown expression: {}", expr);
+    }
+
+    fn compile(&mut self, statements: &[Statement]) {
+        for stmt in statements {
+            match stmt {
+                Statement::If {
+                    condition,
+                    then_branch,
+                    elif_branches,
+                    else_branch,
+                } => {
+                    let end_label = self.new_label("if_end");
+                    
+                    // Compile if
+                    if self.eval_condition(condition) {
+                        self.compile(then_branch);
+                        self.text_section.push(format!("    b {}", end_label));
+                    }
+
+                    // Compile elifs
+                    for (cond, branch) in elif_branches {
+                        if self.eval_condition(cond) {
+                            self.compile(branch);
+                            self.text_section.push(format!("    b {}", end_label));
+                        }
+                    }
+
+                    // Compile else
+                    if let Some(branch) = else_branch {
+                        self.compile(branch);
+                    }
+
+                    self.text_section.push(format!("{}:", end_label));
+                }
+
+                Statement::Print(args) => {
+                    let mut output = Vec::new();
+                    for arg in args {
+                        match self.eval_expr(arg) {
+                            Value::Int(n) => output.push(n.to_string()),
+                            Value::Str(s) => output.push(s),
+                            Value::Bool(b) => output.push(b.to_string()),
+                        }
+                    }
+                    let label = self.add_data(&output.join(" "), true);
+                    self.text_section.extend([
+                        "    // print".to_string(),
+                        "    mov x0, #1".to_string(),
+                        format!("    adr x1, {}", label),
+                        format!("    mov x2, {}_len", label),
+                        "    mov x8, #64".to_string(),
+                        "    svc #0".to_string(),
+                    ]);
+                }
+
+                Statement::Assign(name, expr) => {
+                    let val = self.eval_expr(expr);
+                    self.variables.insert(name.clone(), val);
+                }
+
+                Statement::FunctionCall(name) => {
+                    if let Some(body) = self.functions.get(name) {
+                        let mut temp_compiler = Compiler {
+                            variables: self.variables.clone(),
+                            functions: self.functions.clone(),
+                            data_section: self.data_section.clone(),
+                            text_section: self.text_section.clone(),
+                            label_counter: self.label_counter,
+                        };
+                        temp_compiler.compile(body);
+                        *self = temp_compiler;
+                    }
+                }
+                Statement::Comment => (),  // Skip comments
+            }
+        }
+    }
+
+    fn save_asm(&self, filename: &str) {
+        let mut asm = self.data_section.clone();
+        asm.push("".to_string());
+        asm.extend(self.text_section.clone());
+        asm.extend([
+            "    // Exit".to_string(),
+            "    mov x0, #0".to_string(),
+            "    mov x8, #93".to_string(),
+            "    svc #0".to_string(),
+        ]);
+
+        fs::write(filename, asm.join("\n") + "\n").unwrap();
+    }
+}
+
+fn parse(input: &str) -> Vec<Statement> {
+    let mut statements = Vec::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        if line.starts_with('#') {
+            statements.push(Statement::Comment);
+            i += 1;
+        }
+        else if line.starts_with("if ") && line.ends_with(':') {
+            let condition = line[3..line.len()-1].trim().to_string();
+            i += 1;
+
+            let mut then_branch = Vec::new();
+            while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                then_branch.push(parse_statement(lines[i].trim()));
+                i += 1;
+            }
+
+            let mut elif_branches = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with("elif ") {
+                let cond = lines[i].trim()[5..lines[i].trim().len()-1].trim().to_string();
+                i += 1;
+                let mut branch = Vec::new();
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                    branch.push(parse_statement(lines[i].trim()));
+                    i += 1;
+                }
+                elif_branches.push((cond, branch));
+            }
+
+            let mut else_branch = None;
+            if i < lines.len() && lines[i].trim() == "else:" {
+                i += 1;
+                let mut branch = Vec::new();
+                while i < lines.len() && (lines[i].starts_with("    ") || lines[i].starts_with('\t')) {
+                    branch.push(parse_statement(lines[i].trim()));
+                    i += 1;
+                }
+                else_branch = Some(branch);
+            }
+
+            statements.push(Statement::If {
+                condition,
+                then_branch,
+                elif_branches,
+                else_branch,
+            });
+        } else {
+            statements.push(parse_statement(line));
+            i += 1;
+        }
+    }
+
+    statements
+}
+
+fn parse_statement(line: &str) -> Statement {
+    if line.starts_with("print(") && line.ends_with(')') {
+        let args = line[6..line.len()-1]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        Statement::Print(args)
+    } else if let Some(eq_pos) = line.find('=') {
+        let name = line[..eq_pos].trim().to_string();
+        let expr = line[eq_pos+1..].trim().to_string();
+        Statement::Assign(name, expr)
+    } else if line.ends_with("()") {
+        Statement::FunctionCall(line[..line.len()-2].to_string())
+    } else {
+        panic!("Unsupported statement: {}", line);
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <input.py> [-o output]", args[0]);
+        return;
+    }
+
+    let input = fs::read_to_string(&args[1]).expect("Failed to read input file");
+    let output = if args.len() >= 4 && args[2] == "-o" {
+        &args[3]
+    } else {
+        "a.out"
+    };
+
+    let statements = parse(&input);
+    let mut compiler = Compiler::new();
+    compiler.compile(&statements);
+    compiler.save_asm("out.s");
+
+    Command::new("as")
+        .args(["-o", "out.o", "out.s"])
+        .status()
+        .expect("Failed to assemble");
+
+    Command::new("ld")
+        .args(["-o", output, "out.o"])
+        .status()
+        .expect("Failed to link");
+
+    println!("✅ Compiled to {}", output);
+}

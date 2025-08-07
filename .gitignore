@@ -1,0 +1,6 @@
+*.out
+*.s
+*.o
+
+workspace/outputs
+

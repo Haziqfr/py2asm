@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+import sys
+import subprocess
+import re
+
+if len(sys.argv) < 2:
+    print("Usage: compiler <input.py> [-o <output>]")
+    sys.exit(1)
+
+input_file = sys.argv[1]
+output_file = "a.out"
+if "-o" in sys.argv:
+    o_index = sys.argv.index("-o")
+    if o_index + 1 < len(sys.argv):
+        output_file = sys.argv[o_index + 1]
+    else:
+        print("❌ Output file not specified after -o")
+        sys.exit(1)
+
+with open(input_file) as f:
+    raw_lines = f.readlines()
+
+lines = [line.rstrip('\n') for line in raw_lines]
+
+data_section = []
+text_section = [
+    "    .text",
+    "    .global _start",
+    "_start:"
+]
+
+variables = {}
+functions = {}
+data_count = 0
+label_counter = 0
+
+def new_label(prefix="label"):
+    global label_counter
+    label = f"{prefix}{label_counter}"
+    label_counter += 1
+    return label
+
+def add_data(val, add_newline=True):
+    global data_count, data_section
+    label = f"str{data_count}"
+
+    # Decode Python escapes to real characters (supports \n, \t, \xHH, \uHHHH etc.)
+    real_str = val.encode('utf-8').decode('unicode_escape')
+    if add_newline:
+        real_str += "\n"
+
+    bytes_list = [str(b) for b in real_str.encode('utf-8')]
+
+    data_section.append(f"{label}:")
+    for i in range(0, len(bytes_list), 10):
+        chunk = bytes_list[i:i+10]
+        data_section.append("    .byte " + ", ".join(chunk))
+    data_section.append(f"{label}_len = . - {label}")
+
+    data_count += 1
+    return label
+
+def emit_print(label):
+    return [
+        "    mov x0, #1",
+        f"    adr x1, {label}",
+        f"    mov x2, {label}_len",
+        "    mov x8, #64",
+        "    svc #0"
+    ]
+
+def eval_expr(expr, vars_dict):
+    expr = expr.strip()
+
+    # Handle chr()
+    chr_match = re.fullmatch(r'chr\s*\(\s*(.+)\s*\)', expr)
+    if chr_match:
+        inner_expr = chr_match.group(1)
+        val = eval_expr(inner_expr, vars_dict)
+        if val is None:
+            return None
+        try:
+            return chr(int(val))
+        except:
+            return None
+
+    # Handle ord()
+    ord_match = re.fullmatch(r'ord\s*\(\s*(.+)\s*\)', expr)
+    if ord_match:
+        inner_expr = ord_match.group(1)
+        val = eval_expr(inner_expr, vars_dict)
+        if val is None or not isinstance(val, str) or len(val) != 1:
+            return None
+        return ord(val)
+
+    # Replace variables
+    def repl_var(m):
+        var = m.group(0)
+        if var in vars_dict:
+            val = vars_dict[var]
+            return f'"{val}"' if isinstance(val, str) else str(val)
+        return var
+
+    expr_vars_re = re.compile(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b')
+    expr_eval_str = expr_vars_re.sub(repl_var, expr)
+
+    try:
+        return eval(expr_eval_str, {"__builtins__": {}})
+    except:
+        return None
+
+def collect_block(start_index, lines_to_compile):
+    block = []
+    i = start_index
+    while i < len(lines_to_compile):
+        line = lines_to_compile[i]
+        if line.startswith("    "):
+            block.append(line[4:])
+            i += 1
+        elif line.strip() == "":
+            i += 1
+        else:
+            break
+    return block, i
+
+def compile_lines(lines_to_compile, local_vars):
+    global text_section, variables
+    i = 0
+    while i < len(lines_to_compile):
+        line = lines_to_compile[i].strip()
+        if not line or line.startswith("#"):
+            i += 1
+            continue
+
+        # Handle if / elif / else chains
+        if line.startswith("if ") or line.startswith("elif ") or line.startswith("else:"):
+            branches = []
+
+            # Parse all branches in this chain
+            while i < len(lines_to_compile):
+                curr_line = lines_to_compile[i].strip()
+                if curr_line.startswith("if "):
+                    cond = curr_line[3:].rstrip(":").strip()
+                    block, i = collect_block(i + 1, lines_to_compile)
+                    branches.append(("cond", cond, block))
+                elif curr_line.startswith("elif "):
+                    cond = curr_line[5:].rstrip(":").strip()
+                    block, i = collect_block(i + 1, lines_to_compile)
+                    branches.append(("cond", cond, block))
+                elif curr_line == "else:":
+                    block, i = collect_block(i + 1, lines_to_compile)
+                    branches.append(("else", None, block))
+                    break
+                else:
+                    break
+
+            matched = False
+            for kind, cond, block in branches:
+                if kind == "cond":
+                    if eval_expr(cond, local_vars):
+                        compile_lines(block, dict(local_vars))
+                        matched = True
+                        break
+                elif kind == "else" and not matched:
+                    compile_lines(block, dict(local_vars))
+                    break
+            continue
+
+        # Variable assignment
+        if "=" in line and not line.startswith("print"):
+            name, expr = [x.strip() for x in line.split("=", 1)]
+            val = None
+            if (expr.startswith('"') and expr.endswith('"')) or (expr.startswith("'") and expr.endswith("'")):
+                val = expr[1:-1]
+            else:
+                val = eval_expr(expr, local_vars)
+            if val is None:
+                print(f"❌ Unknown or invalid expression for variable '{name}': {expr}")
+                sys.exit(1)
+            local_vars[name] = val
+            i += 1
+            continue
+
+        # print statement
+        if line.startswith("print(") and line.endswith(")"):
+            args = [arg.strip() for arg in line[6:-1].split(",")]
+            combined = []
+            for arg in args:
+                val = None
+                if (arg.startswith('"') and arg.endswith('"')) or (arg.startswith("'") and arg.endswith("'")):
+                    val = arg[1:-1]
+                else:
+                    val = eval_expr(arg, local_vars)
+                if val is None:
+                    print(f"❌ Unknown variable or invalid expression in print: {arg}")
+                    sys.exit(1)
+                combined.append(str(val))
+            label = add_data(" ".join(combined), add_newline=True)
+            text_section += emit_print(label)
+            i += 1
+            continue
+
+        # function call
+        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*\(\)$', line):
+            func_name = line[:-2]
+            if func_name not in functions:
+                print(f"❌ Call to undefined function: {func_name}")
+                sys.exit(1)
+            compile_lines(functions[func_name], dict(local_vars))
+            i += 1
+            continue
+
+        print(f"❌ Unsupported or unknown line: {line}")
+        sys.exit(1)
+
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if line.strip().startswith("def ") and line.strip().endswith("():"):
+        func_name = line.strip()[4:-3].strip()
+        i += 1
+        func_body = []
+        while i < len(lines):
+            next_line = lines[i]
+            if next_line.startswith("    "):
+                func_body.append(next_line[4:])
+                i += 1
+            elif next_line.strip() == "":
+                i += 1
+            else:
+                break
+        functions[func_name] = func_body
+    else:
+        compile_lines([line], variables)
+        i += 1
+
+text_section += [
+    "    mov x0, #0",
+    "    mov x8, #93",
+    "    svc #0"
+]
+
+asm = [".data"] + data_section + [""] + text_section
+
+with open("out.s", "w") as f:
+    f.write("\n".join(asm) + "\n")
+
+subprocess.run(["as", "-o", "out.o", "out.s"], check=True)
+subprocess.run(["ld", "out.o", "-o", output_file], check=True)
+
+print(f"✅ Compiled to {output_file}")

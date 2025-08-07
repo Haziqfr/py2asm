@@ -2,5 +2,5 @@
 *.s
 *.o
 
-workspace/outputs
+workspace/outputs/*.out
 
